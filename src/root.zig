@@ -7,9 +7,13 @@ const tracy_zig = @This();
 // Set up the implementation based on what's found in root.
 const impl_disabled = @import("impl_disabled");
 const impl = if (@hasDecl(root, "tracy_impl")) b: {
+    // Tracy only supports little endian CPUs
     assert(builtin.cpu.arch.endian() == .little);
     break :b root.tracy_impl;
 } else impl_disabled;
+
+// The max callstack depth supported by Tracy.
+const max_callstack_depth = 62;
 
 // Expose our global options, and whether or not we're enabled publicly.
 pub const Options = struct {
@@ -22,20 +26,17 @@ pub const Options = struct {
     verbose: bool = false,
     data_port: ?u64 = null,
     broadcast_port: ?u64 = null,
-    callstack: Callstack = .{},
-
-    pub const Callstack = struct {
-        zone: bool = false,
-        allocation: bool = false,
-        gpu: bool = false,
-        message: bool = false,
-
-        /// The maximum number of callstacks to capture.
-        depth: u32 = 10,
-    };
+    default_callstack_depth: u6 = 0,
 };
+
+fn getOptions() Options {
+    const result: Options = if (@hasDecl(root, "tracy_options")) root.tracy_options else .{};
+    comptime assert(result.default_callstack_depth <= max_callstack_depth);
+    return result;
+}
+
 pub const enabled = impl != impl_disabled;
-pub const options: Options = if (@hasDecl(root, "tracy_options")) root.tracy_options else .{};
+pub const options: Options = getOptions();
 
 // Bindings follow.
 pub const SourceLocation = extern struct {
@@ -68,20 +69,26 @@ pub const SourceLocation = extern struct {
 pub const Zone = struct {
     ctx: if (enabled) impl.c.TracyCZoneCtx else void,
 
-    pub inline fn begin(comptime opt: SourceLocation.InitOptions) @This() {
+    pub const BeginOptions = struct {
+        name: ?[*:0]const u8 = null,
+        src: std.builtin.SourceLocation,
+        color: Color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+        callstack_depth: u6 = options.default_callstack_depth,
+    };
+
+    pub inline fn begin(comptime opt: BeginOptions) @This() {
+        comptime assert(opt.callstack_depth <= max_callstack_depth);
         if (enabled) {
             return .{
-                .ctx = if (options.callstack.zone)
-                    impl.c.___tracy_emit_zone_begin_callstack(
-                        @intFromPtr(SourceLocation.init(opt)),
-                        options.callstack.depth,
-                        1,
-                    )
-                else
-                    impl.c.___tracy_emit_zone_begin(
-                        @intFromPtr(SourceLocation.init(opt)),
-                        1,
-                    ),
+                .ctx = impl.c.___tracy_emit_zone_begin_callstack(
+                    @intFromPtr(SourceLocation.init(.{
+                        .name = opt.name,
+                        .src = opt.src,
+                        .color = opt.color,
+                    })),
+                    opt.callstack_depth,
+                    1,
+                ),
             };
         } else {
             return .{ .ctx = {} };
@@ -171,23 +178,26 @@ pub const GpuQueue = struct {
     pub const BeginZoneOptions = struct {
         loc: *const SourceLocation,
         query_id: u16,
+        callstack_depth: u6 = options.default_callstack_depth,
     };
 
     pub inline fn beginZone(self: @This(), opt: BeginZoneOptions) void {
+        assert(opt.callstack_depth <= max_callstack_depth);
         if (enabled) {
-            if (options.callstack.gpu)
+            if (opt.callstack_depth > 0) {
                 impl.c.___tracy_emit_gpu_zone_begin_callstack_serial(.{
                     .srcloc = @intFromPtr(opt.loc),
-                    .depth = options.callstack.depth,
                     .queryId = opt.query_id,
                     .context = self.context,
-                })
-            else
+                    .depth = opt.callstack_depth,
+                });
+            } else {
                 impl.c.___tracy_emit_gpu_zone_begin_serial(.{
                     .srcloc = @intFromPtr(opt.loc),
                     .queryId = opt.query_id,
                     .context = self.context,
                 });
+            }
         }
     }
 
@@ -317,20 +327,16 @@ pub fn shutdownProfiler() void {
 pub const MessageOptions = struct {
     text: []const u8,
     color: ?Color = null,
+    callstack_depth: u6 = options.default_callstack_depth,
 };
 
 pub fn message(opt: MessageOptions) void {
+    assert(opt.callstack_depth <= max_callstack_depth); // Max supported Tracy
     if (enabled) {
         if (opt.color) |color| {
-            if (options.callstack.message)
-                impl.c.___tracy_emit_messageC(opt.text.ptr, opt.text.len, @bitCast(color), 0)
-            else
-                impl.c.___tracy_emit_messageC(opt.text.ptr, opt.text.len, @bitCast(color), options.callstack.depth);
+            impl.c.___tracy_emit_messageC(opt.text.ptr, opt.text.len, @bitCast(color), opt.callstack_depth);
         } else {
-            if (options.callstack.message)
-                impl.c.___tracy_emit_message(opt.text.ptr, opt.text.len, 0)
-            else
-                impl.c.___tracy_emit_message(opt.text.ptr, opt.text.len, options.callstack.depth);
+            impl.c.___tracy_emit_message(opt.text.ptr, opt.text.len, opt.callstack_depth);
         }
     }
 }
@@ -394,40 +400,27 @@ pub const AllocOptions = struct {
     size: usize,
     secure: bool = false,
     pool_name: ?[*:0]const u8 = null,
+    callstack_depth: u6 = options.default_callstack_depth,
 };
 
-pub fn alloc(ao: AllocOptions) void {
+pub fn alloc(opt: AllocOptions) void {
+    assert(opt.callstack_depth <= max_callstack_depth);
     if (enabled) {
-        if (ao.pool_name) |pool_name| {
-            if (options.callstack.allocation)
-                impl.c.___tracy_emit_memory_alloc_callstack_named(
-                    ao.ptr,
-                    ao.size,
-                    options.callstack.depth,
-                    @intFromBool(ao.secure),
-                    pool_name,
-                )
-            else
-                impl.c.___tracy_emit_memory_alloc_named(
-                    ao.ptr,
-                    ao.size,
-                    @intFromBool(ao.secure),
-                    pool_name,
-                );
+        if (opt.pool_name) |pool_name| {
+            impl.c.___tracy_emit_memory_alloc_callstack_named(
+                opt.ptr,
+                opt.size,
+                opt.callstack_depth,
+                @intFromBool(opt.secure),
+                pool_name,
+            );
         } else {
-            if (options.callstack.allocation)
-                impl.c.___tracy_emit_memory_alloc_callstack(
-                    ao.ptr,
-                    ao.size,
-                    options.callstack.depth,
-                    @intFromBool(ao.secure),
-                )
-            else
-                impl.c.___tracy_emit_memory_alloc(
-                    ao.ptr,
-                    ao.size,
-                    @intFromBool(ao.secure),
-                );
+            impl.c.___tracy_emit_memory_alloc_callstack(
+                opt.ptr,
+                opt.size,
+                opt.callstack_depth,
+                @intFromBool(opt.secure),
+            );
         }
     }
 }
@@ -436,36 +429,25 @@ pub const FreeOptions = struct {
     ptr: ?*const anyopaque,
     pool_name: ?[*:0]const u8 = null,
     secure: bool = false,
+    callstack_depth: u6 = options.default_callstack_depth,
 };
 
 pub fn free(opt: FreeOptions) void {
+    assert(opt.callstack_depth <= max_callstack_depth);
     if (enabled) {
         if (opt.pool_name) |pool_name| {
-            if (options.callstack.allocation)
-                impl.c.___tracy_emit_memory_free_callstack_named(
-                    opt.ptr,
-                    options.callstack.depth,
-                    @intFromBool(opt.secure),
-                    pool_name,
-                )
-            else
-                impl.c.___tracy_emit_memory_free_named(
-                    opt.ptr,
-                    @intFromBool(opt.secure),
-                    pool_name,
-                );
+            impl.c.___tracy_emit_memory_free_callstack_named(
+                opt.ptr,
+                opt.callstack_depth,
+                @intFromBool(opt.secure),
+                pool_name,
+            );
         } else {
-            if (options.callstack.allocation)
-                impl.c.___tracy_emit_memory_free_callstack(
-                    opt.ptr,
-                    options.callstack.depth,
-                    @intFromBool(opt.secure),
-                )
-            else
-                impl.c.___tracy_emit_memory_free(
-                    opt.ptr,
-                    @intFromBool(opt.secure),
-                );
+            impl.c.___tracy_emit_memory_free_callstack(
+                opt.ptr,
+                opt.callstack_depth,
+                @intFromBool(opt.secure),
+            );
         }
     }
 }
