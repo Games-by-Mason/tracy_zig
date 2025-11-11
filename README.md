@@ -10,6 +10,10 @@ You can integrate Tracy into your library without forcing it on your downstream 
 
 This section walks you through the integration. [There are plans to simplify this.](https://github.com/Games-by-Mason/tracy_zig/issues/8)
 
+## Documentation
+
+Generated documentation for the bindings available [here](https://docs.gamesbymason.com/tracy/), you can generate up to date docs yourself with `zig build docs`. For documentation on Tracy, see [upstream](https://github.com/wolfpld/tracy).
+
 ### Libraries
 
 To integrate Tracy with your library, just add the Tracy module in your build.zig.
